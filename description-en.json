@@ -1,0 +1,67 @@
+{
+  "domainCategory": "Trading",
+  "subjectiveTechnologyElement": "DataSources",
+  "sections": [
+    {
+      "type": "splitList",
+      "title": "Ticker",
+      "text": "A real-time data source that triggers ticks at configurable intervals.",
+      "image": {
+        "src": "/subjective_ticker_datasource/icon.svg",
+        "alt": "Ticker icon"
+      },
+      "list": [
+        "Connection type: Custom",
+        "Config fields: connection_name",
+        "Output: Emits a real-time stream of events/items for downstream subscribers."
+      ]
+    },
+    {
+      "type": "example",
+      "title": "Typical workflow",
+      "intro": "Configure Ticker with the connection fields and run it as part of a BrainBoost pipeline.",
+      "cards": [
+        {
+          "title": "Connect",
+          "text": "Provide connection_name in the connection form."
+        },
+        {
+          "title": "Fetch",
+          "text": "Run `fetch()` to ingest, transform, or stream data."
+        },
+        {
+          "title": "Consume",
+          "text": "Use the emitted items in downstream indexing, search, or automation steps."
+        }
+      ]
+    },
+    {
+      "type": "faq",
+      "title": "FAQ",
+      "items": [
+        {
+          "q": "What do I need to configure?",
+          "a": "At minimum: connection_name. Additional fields may be optional depending on your use case."
+        },
+        {
+          "q": "What does it output?",
+          "a": "Emits a real-time stream of events/items for downstream subscribers."
+        },
+        {
+          "q": "Where does the data go?",
+          "a": "Outputs are emitted to downstream subscribers in the BrainBoost pipeline. Some datasources also write artifacts (context files, catalogs, or exports) locally based on your configuration."
+        }
+      ]
+    },
+    {
+      "type": "finalCta",
+      "title": "Ready to use Ticker?",
+      "text": "Add it to your BrainBoost pipeline and start ingesting.",
+      "primaryCta": {
+        "label": "Get Subjective Client",
+        "href": "/subjective-client-download"
+      },
+      "subtext": "Run this datasource locally with your own credentials and storage."
+    }
+  ]
+}
