@@ -1,4 +1,5 @@
 {
+  "description": "Emits scheduled realtime tick events (seconds/minutes/cron modes) to drive time-based downstream pipeline execution.",
   "domainCategory": "Trading",
   "subjectiveTechnologyElement": "DataSources",
   "publisher": "BrainBoost Ltd.",
@@ -9,7 +10,7 @@
     {
       "type": "splitList",
       "title": "Ticker",
-      "text": "A real-time data source that triggers ticks at configurable intervals.",
+      "text": "Emits scheduled realtime tick events (seconds/minutes/cron modes) to drive time-based downstream pipeline execution.",
       "image": {
         "src": "/subjective_ticker_datasource/icon.svg",
         "alt": "Ticker icon"
