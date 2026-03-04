@@ -8,31 +8,35 @@ from subjective_abstract_data_source_package import SubjectiveRealTimeDataSource
 from brainboost_data_source_logger_package.BBLogger import BBLogger
 
 
+UNIT_TO_SECONDS = {
+    "ms": 0.001,
+    "sec": 1.0,
+    "min": 60.0,
+    "hour": 3600.0,
+}
+
+
 class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
     """
     A real-time data source that triggers ticks at configurable intervals.
 
     This data source emits "tick" events that can be used to trigger downstream
-    data sources in a pipeline. It supports three timing modes:
+    data sources in a pipeline. It supports two timing modes:
 
-    1. Seconds-based: tick every N seconds
-    2. Minutes-based: tick every N minutes
-    3. Cron expression: tick according to a cron schedule
+    1. Time + Unit: tick every N units (hour, min, sec, ms)
+    2. Cron expression: tick according to a cron schedule
+
+    Provide either (time + unit) OR cron, not both.
 
     Each tick emits:
     - A notification to all subscriber data sources
     - A Redis signal on the configured channel
 
     Parameters (via params dict):
-        interval_type (str): "seconds", "minutes", or "cron". Default: "seconds"
-        interval_value (float/str):
-            - For seconds/minutes: numeric value (e.g., 30 for 30 seconds)
-            - For cron: cron expression string (e.g., "*/5 * * * *" for every 5 minutes)
-        tick_params (dict): Additional parameters to include in each tick notification
-        tick_count (int): Maximum number of ticks to emit. -1 for unlimited. Default: -1
-        include_tick_number (bool): Include tick count in notifications. Default: True
-        include_elapsed_time (bool): Include elapsed time in notifications. Default: True
-        auto_start (bool): Start ticking on fetch(). Default: True
+        time (float): Numeric interval value (e.g., 30). Used with 'unit'.
+        unit (str): One of "hour", "min", "sec", "ms". Used with 'time'.
+        cron (str): Cron expression string (e.g., "*/5 * * * *"). Alternative to time+unit.
+        subscriber (str): Name of an existing connection to subscribe to this ticker.
         redis_channel (str): Redis channel for tick notifications. Default: "ticker_events"
         datasource_id (str): Identifier for this ticker instance
 
@@ -42,8 +46,8 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         ticker = SubjectiveTickerDataSource(
             name="my_ticker",
             params={
-                "interval_type": "seconds",
-                "interval_value": 30,
+                "time": 30,
+                "unit": "sec",
                 "redis_channel": "pipeline_triggers"
             }
         )
@@ -52,9 +56,7 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         ticker = SubjectiveTickerDataSource(
             name="cron_ticker",
             params={
-                "interval_type": "cron",
-                "interval_value": "*/5 * * * *",
-                "tick_params": {"source": "scheduler"}
+                "cron": "*/5 * * * *"
             }
         )
         ```
@@ -62,11 +64,10 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
 
     connection_type = "Ticker"
     connection_fields = [
-        "interval_type",
-        "interval_value",
-        "tick_count",
-        "tick_params",
-        "auto_start"
+        "time",
+        "unit",
+        "cron",
+        "subscriber"
     ]
 
     def __init__(self, name=None, session=None, dependency_data_sources=None,
@@ -79,16 +80,24 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
             params=params or {}
         )
 
-        # Timing configuration
-        self._interval_type = self.params.get("interval_type", "seconds").lower()
-        self._interval_value = self.params.get("interval_value", 60)
+        # Timing configuration: either cron or time+unit
+        self._cron_expression = self.params.get("cron", "").strip() if self.params.get("cron") else ""
+        self._time_value = self._coerce_float_param("time", 0)
+        self._unit = self.params.get("unit", "sec").lower()
 
-        # Tick configuration
-        self._tick_params = self.params.get("tick_params", {}) or {}
-        self._tick_count_limit = self._coerce_int_param("tick_count", -1)
-        self._include_tick_number = self._coerce_bool_param("include_tick_number", True)
-        self._include_elapsed_time = self._coerce_bool_param("include_elapsed_time", True)
-        self._auto_start = self._coerce_bool_param("auto_start", True)
+        if self._cron_expression:
+            self._mode = "cron"
+        else:
+            self._mode = "interval"
+            if self._unit not in UNIT_TO_SECONDS:
+                BBLogger.log(f"Unknown unit '{self._unit}', defaulting to 'sec'")
+                self._unit = "sec"
+            if self._time_value <= 0:
+                BBLogger.log("Time value must be > 0, defaulting to 60")
+                self._time_value = 60
+
+        # Subscriber configuration
+        self._subscriber_connection = self.params.get("subscriber", "")
 
         # Redis configuration
         self._redis_channel = self.params.get("redis_channel", "ticker_events")
@@ -100,10 +109,15 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         self._stop_event = threading.Event()
         self._cron_iter = None
 
-        BBLogger.log(
-            f"SubjectiveTickerDataSource initialized: "
-            f"type={self._interval_type}, value={self._interval_value}"
-        )
+        if self._mode == "cron":
+            BBLogger.log(
+                f"SubjectiveTickerDataSource initialized: cron={self._cron_expression}"
+            )
+        else:
+            BBLogger.log(
+                f"SubjectiveTickerDataSource initialized: "
+                f"time={self._time_value}, unit={self._unit}"
+            )
 
     def _coerce_bool_param(self, key, default):
         """Convert parameter to boolean."""
@@ -119,21 +133,15 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
 
     def _get_interval_seconds(self):
         """
-        Calculate the interval in seconds based on interval_type.
+        Calculate the interval in seconds based on time and unit.
 
         Returns:
-            float: Interval in seconds
+            float: Interval in seconds, or None if using cron mode.
         """
-        if self._interval_type == "seconds":
-            return float(self._interval_value)
-        elif self._interval_type == "minutes":
-            return float(self._interval_value) * 60
-        elif self._interval_type == "cron":
-            # For cron, we calculate dynamically in the tick loop
+        if self._mode == "cron":
             return None
-        else:
-            BBLogger.log(f"Unknown interval_type '{self._interval_type}', defaulting to 60 seconds")
-            return 60.0
+        multiplier = UNIT_TO_SECONDS.get(self._unit, 1.0)
+        return self._time_value * multiplier
 
     def _get_next_cron_delay(self):
         """
@@ -161,19 +169,21 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         self._stop_event.clear()
 
         # Initialize cron iterator if using cron mode
-        if self._interval_type == "cron":
+        if self._mode == "cron":
             try:
                 from croniter import croniter
-                self._cron_iter = croniter(str(self._interval_value), datetime.now())
-                BBLogger.log(f"Cron expression initialized: {self._interval_value}")
+                self._cron_iter = croniter(self._cron_expression, datetime.now())
+                BBLogger.log(f"Cron expression initialized: {self._cron_expression}")
             except ImportError:
-                BBLogger.log("croniter not installed, falling back to 60 second interval")
-                self._interval_type = "seconds"
-                self._interval_value = 60
+                BBLogger.log("croniter not installed, falling back to 60 sec interval")
+                self._mode = "interval"
+                self._time_value = 60
+                self._unit = "sec"
             except Exception as e:
-                BBLogger.log(f"Invalid cron expression '{self._interval_value}': {e}")
-                self._interval_type = "seconds"
-                self._interval_value = 60
+                BBLogger.log(f"Invalid cron expression '{self._cron_expression}': {e}")
+                self._mode = "interval"
+                self._time_value = 60
+                self._unit = "sec"
 
         BBLogger.log(f"Tick monitoring initialized for {self.__class__.__name__}")
 
@@ -184,21 +194,15 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         This runs in a background thread and sends tick notifications to all
         subscribers and via Redis at each tick.
         """
-        interval_desc = (
-            f"cron({self._interval_value})"
-            if self._interval_type == "cron"
-            else f"{self._interval_value} {self._interval_type}"
-        )
+        if self._mode == "cron":
+            interval_desc = f"cron({self._cron_expression})"
+        else:
+            interval_desc = f"{self._time_value} {self._unit}"
         BBLogger.log(f"Starting tick loop: {interval_desc}")
 
         while self._monitoring_active and not self._stop_event.is_set():
-            # Check tick count limit
-            if self._tick_count_limit > 0 and self._tick_number >= self._tick_count_limit:
-                BBLogger.log(f"Tick count limit reached ({self._tick_count_limit}), stopping")
-                break
-
-            # Calculate wait time based on interval type
-            if self._interval_type == "cron":
+            # Calculate wait time based on mode
+            if self._mode == "cron":
                 wait_time = self._get_next_cron_delay()
             else:
                 wait_time = self._get_interval_seconds()
@@ -236,7 +240,7 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         Build the tick notification data dictionary.
 
         Returns:
-            dict: Tick data including timestamp, configured params, and metrics
+            dict: Tick data including timestamp and metrics
         """
         tick_data = {
             "tick": True,
@@ -244,25 +248,21 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
             "timestamp_iso": datetime.now().isoformat(),
             "datasource_id": self._datasource_id,
             "datasource_type": self.__class__.__name__,
-            "interval_type": self._interval_type,
-            "interval_value": self._interval_value,
+            "mode": self._mode,
+            "tick_number": self._tick_number + 1,
         }
 
-        # Add tick number if configured
-        if self._include_tick_number:
-            tick_data["tick_number"] = self._tick_number + 1  # 1-indexed for display
+        if self._mode == "cron":
+            tick_data["cron"] = self._cron_expression
+        else:
+            tick_data["time"] = self._time_value
+            tick_data["unit"] = self._unit
 
-        # Add elapsed time if configured
-        if self._include_elapsed_time and self._start_time is not None:
+        if self._start_time is not None:
             tick_data["elapsed_time"] = time.time() - self._start_time
 
-        # Add tick count limit info if set
-        if self._tick_count_limit > 0:
-            tick_data["remaining_ticks"] = self._tick_count_limit - self._tick_number - 1
-
-        # Merge in user-provided tick parameters
-        if self._tick_params:
-            tick_data.update(self._tick_params)
+        if self._subscriber_connection:
+            tick_data["subscriber"] = self._subscriber_connection
 
         return tick_data
 
@@ -286,54 +286,44 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
             return 0.0
         return time.time() - self._start_time
 
-    def set_interval(self, interval_type, interval_value):
+    def set_interval(self, time_value=None, unit=None, cron=None):
         """
         Update the tick interval.
 
         Note: Takes effect on the next tick cycle.
+        Provide either (time_value + unit) OR cron, not both.
 
         Args:
-            interval_type (str): "seconds", "minutes", or "cron"
-            interval_value: Numeric value or cron expression
+            time_value (float, optional): Numeric interval value.
+            unit (str, optional): One of "hour", "min", "sec", "ms".
+            cron (str, optional): Cron expression string.
         """
-        self._interval_type = interval_type.lower()
-        self._interval_value = interval_value
-
-        # Reinitialize cron iterator if switching to cron mode
-        if self._interval_type == "cron":
+        if cron:
+            self._mode = "cron"
+            self._cron_expression = cron.strip()
             try:
                 from croniter import croniter
-                self._cron_iter = croniter(str(interval_value), datetime.now())
+                self._cron_iter = croniter(self._cron_expression, datetime.now())
             except Exception as e:
                 BBLogger.log(f"Failed to set cron interval: {e}")
                 return
+            BBLogger.log(f"Tick interval updated to cron: {self._cron_expression}")
+        else:
+            self._mode = "interval"
+            if time_value is not None:
+                self._time_value = float(time_value)
+            if unit is not None:
+                self._unit = unit.lower()
+            BBLogger.log(f"Tick interval updated to {self._time_value} {self._unit}")
 
-        BBLogger.log(f"Tick interval updated to {interval_value} {interval_type}")
-
-    def set_tick_params(self, tick_params):
-        """
-        Update the parameters included in tick notifications.
-
-        Args:
-            tick_params (dict): Parameters to merge into tick notifications
-        """
-        self._tick_params = tick_params or {}
-        BBLogger.log(f"Tick params updated: {self._tick_params}")
-
-    def trigger_immediate(self, extra_params=None):
+    def trigger_immediate(self):
         """
         Trigger an immediate tick notification outside the regular interval.
 
         This is useful for manually triggering dependent data sources.
-
-        Args:
-            extra_params (dict, optional): Additional parameters for this tick only
         """
         tick_data = self._build_tick_data()
         tick_data["immediate"] = True
-
-        if extra_params:
-            tick_data.update(extra_params)
 
         BBLogger.log("Triggering immediate tick notification")
         self.send_notification(tick_data)
@@ -342,24 +332,31 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
 
     def fetch(self):
         """
-        Start the tick data source.
+        Start the tick data source and begin emitting ticks immediately.
 
-        If auto_start is True (default), begins emitting ticks immediately.
         Returns status information about the tick source.
         """
         BBLogger.log(f"Fetch called on tick data source {self.__class__.__name__}")
 
-        if self._auto_start:
-            self.start_monitoring()
+        self.start_monitoring()
 
-        return {
+        status = {
             "status": "running" if self._monitoring_active else "ready",
             "datasource": self.get_name(),
-            "interval_type": self._interval_type,
-            "interval_value": self._interval_value,
-            "tick_count_limit": self._tick_count_limit,
-            "redis_channel": self._redis_channel
+            "mode": self._mode,
+            "redis_channel": self._redis_channel,
         }
+
+        if self._mode == "cron":
+            status["cron"] = self._cron_expression
+        else:
+            status["time"] = self._time_value
+            status["unit"] = self._unit
+
+        if self._subscriber_connection:
+            status["subscriber"] = self._subscriber_connection
+
+        return status
 
     def get_icon(self) -> str:
         """Return SVG icon for the ticker data source."""
