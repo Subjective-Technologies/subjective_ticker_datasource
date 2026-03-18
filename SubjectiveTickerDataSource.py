@@ -62,28 +62,22 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         ```
     """
 
-    connection_type = "Ticker"
-    connection_fields = [
-        "time",
-        "unit",
-        "cron",
-        "subscriber"
-    ]
-
-    def __init__(self, name=None, session=None, dependency_data_sources=None,
-                 subscribers=None, params=None):
-        super().__init__(
-            name=name,
-            session=session,
-            dependency_data_sources=dependency_data_sources or [],
-            subscribers=subscribers,
-            params=params or {}
-        )
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        conn = getattr(self, "_connection", {}) or {}
+        params = self.params if isinstance(self.params, dict) else {}
 
         # Timing configuration: either cron or time+unit
-        self._cron_expression = self.params.get("cron", "").strip() if self.params.get("cron") else ""
-        self._time_value = self._coerce_float_param("time", 0)
-        self._unit = self.params.get("unit", "sec").lower()
+        cron_value = conn.get("cron")
+        if cron_value is None:
+            cron_value = params.get("cron")
+        self._cron_expression = str(cron_value).strip() if cron_value else ""
+
+        time_value = conn.get("time") if "time" in conn else params.get("time")
+        self._time_value = self._coerce_float_value(time_value, 0)
+
+        unit_value = conn.get("unit") or params.get("unit") or "sec"
+        self._unit = str(unit_value).lower()
 
         if self._cron_expression:
             self._mode = "cron"
@@ -97,11 +91,16 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
                 self._time_value = 60
 
         # Subscriber configuration
-        self._subscriber_connection = self.params.get("subscriber", "")
+        self._subscriber_connection = conn.get("subscriber") or params.get("subscriber", "")
 
         # Redis configuration
-        self._redis_channel = self.params.get("redis_channel", "ticker_events")
-        self._datasource_id = self.params.get("datasource_id", name or "ticker")
+        self._redis_channel = conn.get("redis_channel") or params.get("redis_channel", "ticker_events")
+        self._datasource_id = (
+            conn.get("datasource_id")
+            or params.get("datasource_id")
+            or self.connection_name
+            or "ticker"
+        )
 
         # Runtime state
         self._tick_number = 0
@@ -119,6 +118,97 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
                 f"time={self._time_value}, unit={self._unit}"
             )
 
+    @classmethod
+    def connection_schema(cls):
+        return {
+            "time": {
+                "type": "number",
+                "label": "Interval Value",
+                "description": "Numeric interval value. Use together with Unit, or leave blank and set Cron instead.",
+                "required": False,
+            },
+            "unit": {
+                "type": "select",
+                "label": "Interval Unit",
+                "description": "Unit used with Interval Value.",
+                "required": False,
+                "default": "sec",
+                "options": ["ms", "sec", "min", "hour"],
+            },
+            "cron": {
+                "type": "text",
+                "label": "Cron Expression",
+                "description": "Cron schedule. Use this instead of Interval Value + Unit.",
+                "required": False,
+            },
+            "subscriber": {
+                "type": "text",
+                "label": "Subscriber Connection",
+                "description": "Optional connection name of a downstream subscriber.",
+                "required": False,
+            },
+            "redis_channel": {
+                "type": "text",
+                "label": "Redis Channel",
+                "description": "Redis channel used for emitted tick notifications.",
+                "required": False,
+                "default": "ticker_events",
+            },
+            "datasource_id": {
+                "type": "text",
+                "label": "Datasource ID",
+                "description": "Identifier included in emitted tick payloads.",
+                "required": False,
+            },
+        }
+
+    @classmethod
+    def request_schema(cls):
+        return {}
+
+    @classmethod
+    def output_schema(cls):
+        return {
+            "tick": {"type": "bool", "label": "Tick"},
+            "timestamp": {"type": "number", "label": "Timestamp"},
+            "timestamp_iso": {"type": "text", "label": "Timestamp ISO"},
+            "datasource_id": {"type": "text", "label": "Datasource ID"},
+            "datasource_type": {"type": "text", "label": "Datasource Type"},
+            "mode": {
+                "type": "select",
+                "label": "Mode",
+                "options": ["interval", "cron"],
+            },
+            "tick_number": {"type": "int", "label": "Tick Number"},
+            "cron": {"type": "text", "label": "Cron Expression"},
+            "time": {"type": "number", "label": "Interval Value"},
+            "unit": {
+                "type": "select",
+                "label": "Interval Unit",
+                "options": ["ms", "sec", "min", "hour"],
+            },
+            "elapsed_time": {"type": "number", "label": "Elapsed Time"},
+            "subscriber": {"type": "text", "label": "Subscriber"},
+            "immediate": {"type": "bool", "label": "Immediate Tick"},
+        }
+
+    @classmethod
+    def icon(cls) -> str:
+        """Return SVG icon for the ticker data source."""
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
+        try:
+            with open(icon_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except Exception as e:
+            BBLogger.log(f"Error reading icon file: {e}")
+
+        return '''<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+            <polyline points="12,6 12,12 16,14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>'''
+
     def _coerce_bool_param(self, key, default):
         """Convert parameter to boolean."""
         try:
@@ -128,6 +218,14 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
             if isinstance(value, str):
                 return value.lower() in ('true', '1', 'yes', 'on')
             return bool(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_float_value(self, value, default):
+        try:
+            if value is None or value == "":
+                return default
+            return float(value)
         except (TypeError, ValueError):
             return default
 
@@ -330,54 +428,16 @@ class SubjectiveTickerDataSource(SubjectiveRealTimeDataSource):
         self.send_redis_notification(self._redis_channel, tick_data)
         self._tick_number += 1
 
-    def fetch(self):
-        """
-        Start the tick data source and begin emitting ticks immediately.
+    def run(self, request):
+        return self.stream(request)
 
-        Returns status information about the tick source.
-        """
-        BBLogger.log(f"Fetch called on tick data source {self.__class__.__name__}")
-
+    def stream(self, request=None):
+        BBLogger.log(f"stream() called on tick data source {self.__class__.__name__}")
         self.start_monitoring()
-
-        status = {
-            "status": "running" if self._monitoring_active else "ready",
-            "datasource": self.get_name(),
-            "mode": self._mode,
-            "redis_channel": self._redis_channel,
-        }
-
-        if self._mode == "cron":
-            status["cron"] = self._cron_expression
-        else:
-            status["time"] = self._time_value
-            status["unit"] = self._unit
-
-        if self._subscriber_connection:
-            status["subscriber"] = self._subscriber_connection
-
-        return status
-
-    def get_icon(self) -> str:
-        """Return SVG icon for the ticker data source."""
-        icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
         try:
-            with open(icon_path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    return content
-        except Exception as e:
-            BBLogger.log(f"Error reading icon file: {e}")
-
-        # Fallback clock icon
-        return '''<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
-            <polyline points="12,6 12,12 16,14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>'''
-
-    def get_connection_data(self) -> dict:
-        """Return connection configuration for the ticker data source."""
-        return {
-            "connection_type": self.connection_type,
-            "fields": list(self.connection_fields)
-        }
+            while self._monitoring_active and not self._stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            BBLogger.log("Ticker interrupted; stopping monitoring.")
+        finally:
+            self.stop_monitoring()
